@@ -160,12 +160,37 @@ class VisualizerAgent(BaseAgent):
                     aspect_ratio=aspect_ratio,
                     image_size="1k",
                 )
-            
-            if "gemini" in self.model_name:
+
+            backend = generation_utils.get_model_backend(self.model_name)
+
+            if backend == "gemini":
                 response_list = await generation_utils.call_gemini_with_retry_async(
                     model_name=self.model_name,
                     contents=content_list,
                     config=types.GenerateContentConfig(**gen_config_args),
+                    max_attempts=5,
+                    retry_delay=30,
+                )
+            elif backend == "openai" and cfg["use_image_generation"]:
+                # Third-party provider serving image model via chat completions
+                response_list = await generation_utils.call_openai_image_chat_with_retry_async(
+                    model_name=self.model_name,
+                    prompt=prompt_text,
+                    system_prompt=self.system_prompt,
+                    max_attempts=5,
+                    retry_delay=30,
+                )
+            elif backend == "openai":
+                # Text/code generation via OpenAI-compatible endpoint
+                response_list = await generation_utils.call_openai_with_retry_async(
+                    model_name=self.model_name,
+                    contents=content_list,
+                    config={
+                        "system_prompt": self.system_prompt,
+                        "temperature": self.exp_config.temperature,
+                        "candidate_num": 1,
+                        "max_completion_tokens": gen_config_args.get("max_output_tokens", 50000),
+                    },
                     max_attempts=5,
                     retry_delay=30,
                 )

@@ -40,7 +40,7 @@ from pathlib import Path
 config_path = Path(__file__).parent.parent / "configs" / "model_config.yaml"
 model_config = {}
 if config_path.exists():
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         model_config = yaml.safe_load(f) or {}
 
 def get_config_val(section, key, env_var, default=""):
@@ -60,20 +60,56 @@ else:
 
 
 anthropic_api_key = get_config_val("api_keys", "anthropic_api_key", "ANTHROPIC_API_KEY", "")
+anthropic_base_url = get_config_val("base_urls", "anthropic_base_url", "ANTHROPIC_BASE_URL", "")
 if anthropic_api_key:
-    anthropic_client = AsyncAnthropic(api_key=anthropic_api_key)
-    print("Initialized Anthropic Client with API Key")
+    anthropic_client_kwargs = {"api_key": anthropic_api_key}
+    if anthropic_base_url:
+        anthropic_client_kwargs["base_url"] = anthropic_base_url
+    anthropic_client = AsyncAnthropic(**anthropic_client_kwargs)
+    print(f"Initialized Anthropic Client with API Key{' and custom base_url' if anthropic_base_url else ''}")
 else:
     print("Warning: Could not initialize Anthropic Client. Missing credentials.")
     anthropic_client = None
 
 openai_api_key = get_config_val("api_keys", "openai_api_key", "OPENAI_API_KEY", "")
+openai_base_url = get_config_val("base_urls", "openai_base_url", "OPENAI_BASE_URL", "")
+# "chat" -> /v1/chat/completions  |  "responses" -> /v1/responses
+openai_api_style = get_config_val("", "openai_api_style", "OPENAI_API_STYLE", "chat")
+if not openai_api_style:
+    openai_api_style = model_config.get("openai_api_style", "chat") or "chat"
+
+# API style for image models; falls back to openai_api_style if not explicitly set
+image_api_style = model_config.get("image_api_style") or os.getenv("IMAGE_API_STYLE") or openai_api_style
 if openai_api_key:
-    openai_client = AsyncOpenAI(api_key=openai_api_key)
-    print("Initialized OpenAI Client with API Key")
+    openai_client_kwargs = {"api_key": openai_api_key}
+    if openai_base_url:
+        openai_client_kwargs["base_url"] = openai_base_url
+    openai_client = AsyncOpenAI(**openai_client_kwargs)
+    print(f"Initialized OpenAI Client with API Key{' and custom base_url' if openai_base_url else ''}")
 else:
     print("Warning: Could not initialize OpenAI Client. Missing credentials.")
     openai_client = None
+
+
+def get_model_backend(model_name: str) -> str:
+    """
+    Determine which backend to use for a given model name.
+
+    Rules:
+    - If openai_base_url is configured, ALL models are routed through the OpenAI-compatible
+      client (third-party provider). The model name is passed as-is to the API.
+    - Otherwise fall back to native SDK routing:
+        * "gemini" in name  -> "gemini"
+        * "claude" / "anthropic" in name -> "claude"
+        * default -> "openai"
+    """
+    if openai_base_url:
+        return "openai"
+    if "gemini" in model_name.lower():
+        return "gemini"
+    if "claude" in model_name.lower() or "anthropic" in model_name.lower():
+        return "claude"
+    return "openai"
 
 
 
@@ -102,7 +138,51 @@ async def call_gemini_with_retry_async(
 ):
     """
     ASYNC: Call Gemini API with asynchronous retry logic.
+
+    When `openai_base_url` is configured (third-party provider), this function
+    transparently forwards the request to `call_openai_with_retry_async` so that
+    all existing callers work without modification.
     """
+    # --- Third-party provider redirect ---
+    if openai_base_url:
+        # Extract generation parameters from the Gemini config object gracefully
+        system_prompt = ""
+        temperature = 1.0
+        candidate_num = 1
+        max_output_tokens = 50000
+        if hasattr(config, "system_instruction"):
+            system_prompt = config.system_instruction or ""
+        if hasattr(config, "temperature") and config.temperature is not None:
+            temperature = config.temperature
+        if hasattr(config, "candidate_count") and config.candidate_count is not None:
+            candidate_num = config.candidate_count
+        if hasattr(config, "max_output_tokens") and config.max_output_tokens is not None:
+            max_output_tokens = config.max_output_tokens
+
+        openai_config = {
+            "system_prompt": system_prompt,
+            "temperature": temperature,
+            "candidate_num": candidate_num,
+            "max_completion_tokens": max_output_tokens,
+        }
+        if openai_api_style == "responses":
+            return await call_openai_responses_with_retry_async(
+                model_name=model_name,
+                contents=contents,
+                config=openai_config,
+                max_attempts=max_attempts,
+                retry_delay=retry_delay,
+                error_context=error_context,
+            )
+        return await call_openai_with_retry_async(
+            model_name=model_name,
+            contents=contents,
+            config=openai_config,
+            max_attempts=max_attempts,
+            retry_delay=retry_delay,
+            error_context=error_context,
+        )
+
     if gemini_client is None:
         raise RuntimeError(
             "Gemini client was not initialized: missing Google API key. "
@@ -317,6 +397,86 @@ async def call_claude_with_retry_async(
 
     return response_text_list
 
+
+async def call_openai_responses_with_retry_async(
+    model_name, contents, config, max_attempts=5, retry_delay=30, error_context=""
+):
+    """
+    ASYNC: Call OpenAI Responses API (/v1/responses) with retry logic.
+    Used when openai_api_style = "responses" (e.g. DeepRouter /v1/responses endpoint).
+
+    The Responses API uses:
+      client.responses.create(model, input, instructions, ...)
+    and returns response.output_text directly.
+    """
+    system_prompt = config["system_prompt"]
+    temperature = config["temperature"]
+    candidate_num = config["candidate_num"]
+    max_output_tokens = config["max_completion_tokens"]
+    response_text_list = []
+
+    # Build the input in Responses API format.
+    # Text-only -> pass as plain string for simplicity.
+    # Multimodal -> build a user message with image_url parts.
+    def _build_responses_input(c):
+        parts = _convert_to_openai_format(c)
+        # If all parts are text, collapse to a single string
+        if all(p.get("type") == "text" for p in parts):
+            return " ".join(p["text"] for p in parts)
+        # Otherwise wrap in a user message object
+        return [{"role": "user", "content": parts}]
+
+    is_input_valid = False
+    for attempt in range(max_attempts):
+        try:
+            input_contents = _build_responses_input(contents)
+            first_response = await openai_client.responses.create(
+                model=model_name,
+                input=input_contents,
+                instructions=system_prompt,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+            )
+            response_text_list.append(first_response.output_text)
+            is_input_valid = True
+            break
+        except Exception as e:
+            context_msg = f" for {error_context}" if error_context else ""
+            print(
+                f"Responses API attempt {attempt + 1} failed{context_msg}: {e}. Retrying in {retry_delay} seconds..."
+            )
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(retry_delay)
+
+    if not is_input_valid:
+        context_msg = f" for {error_context}" if error_context else ""
+        print(f"Error: All {max_attempts} attempts failed{context_msg}. Returning errors.")
+        return ["Error"] * candidate_num
+
+    remaining_candidates = candidate_num - 1
+    if remaining_candidates > 0:
+        input_contents = _build_responses_input(contents)
+        tasks = [
+            openai_client.responses.create(
+                model=model_name,
+                input=input_contents,
+                instructions=system_prompt,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+            )
+            for _ in range(remaining_candidates)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                print(f"Error generating a subsequent candidate: {res}")
+                response_text_list.append("Error")
+            else:
+                response_text_list.append(res.output_text)
+
+    return response_text_list
+
+
 async def call_openai_with_retry_async(
     model_name, contents, config, max_attempts=5, retry_delay=30, error_context=""
 ):
@@ -454,3 +614,74 @@ async def call_openai_image_generation_with_retry_async(
                 return ["Error"]
 
     return ["Error"]
+
+
+async def call_openai_image_chat_with_retry_async(
+    model_name, prompt, system_prompt="", max_attempts=5, retry_delay=30, error_context=""
+):
+    """
+    ASYNC: Generate an image via an OpenAI-compatible endpoint.
+    Supports both chat completions (/v1/chat/completions) and
+    Responses API (/v1/responses) depending on openai_api_style.
+
+    Returns a list with one base64-encoded PNG/JPEG string, or ["Error"] on failure.
+    """
+    import re as _re
+
+    def _extract_image(content: str):
+        """Try to pull a base64 image out of a text response."""
+        data_url_match = _re.search(
+            r"data:image/[^;]+;base64,([A-Za-z0-9+/=]+)", content
+        )
+        if data_url_match:
+            return data_url_match.group(1)
+        stripped = content.strip()
+        if stripped and _re.fullmatch(r"[A-Za-z0-9+/=\n]+", stripped) and len(stripped) > 200:
+            return stripped.replace("\n", "")
+        return None
+
+    for attempt in range(max_attempts):
+        try:
+            if image_api_style == "responses":
+                response = await openai_client.responses.create(
+                    model=model_name,
+                    input=prompt,
+                    instructions=system_prompt or None,
+                )
+                content = response.output_text or ""
+            else:
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": prompt})
+                response = await openai_client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                )
+                content = response.choices[0].message.content or ""
+
+            img = _extract_image(content)
+            if img:
+                return [img]
+
+            print(
+                f"[Warning] call_openai_image_chat: response does not appear to contain "
+                f"a base64 image. Raw content preview: {content[:200]}"
+            )
+            return [content]
+
+        except Exception as e:
+            context_msg = f" for {error_context}" if error_context else ""
+            print(
+                f"Attempt {attempt + 1} for image-chat model {model_name} failed"
+                f"{context_msg}: {e}. Retrying in {retry_delay} seconds..."
+            )
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(retry_delay)
+            else:
+                print(f"Error: All {max_attempts} attempts failed{context_msg}")
+                return ["Error"]
+
+    return ["Error"]
+
+

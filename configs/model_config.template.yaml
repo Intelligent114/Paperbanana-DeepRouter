@@ -16,11 +16,28 @@
 
 # Default Models
 defaults:
-  model_name: "" # e.g., "gemini-3-pro-preview"
-  image_model_name: "" # e.g., "gemini-3-pro-image-preview"
-  
-# API Keys. If you are using all gemini models, you can leave the other keys empty.
+  model_name: "gemini-3-flash-preview"
+  image_model_name: "gemini-3-pro-image-preview"
+
+# API Keys.
 api_keys:
-  google_api_key: "" # e.g. "xxxxxxxxxxxxx"
-  openai_api_key: ""
+  google_api_key: ""
+  openai_api_key: ""   # DeepRouter API Key
   anthropic_api_key: ""
+
+# Base URLs for third-party API providers.
+# All models (including gemini-*) will be routed through the OpenAI-compatible
+# client when openai_base_url is set.
+base_urls:
+  openai_base_url: "https://deeprouter.top/v1"   # DeepRouter endpoint (without /responses)
+  anthropic_base_url: ""
+
+# OpenAI API style: "chat" (default, uses /v1/chat/completions)
+#                   "responses" (uses /v1/responses, OpenAI Responses API)
+openai_api_style: "chat"
+
+# API style specifically for the image model (image_model_name).
+# Override here if the image model uses a different endpoint than openai_api_style.
+# "chat" -> /v1/chat/completions   "responses" -> /v1/responses
+image_api_style: "chat"
+

@@ -1,3 +1,5 @@
+## This project is based on paperbanana (Apache 2.0 License) with custom modifications.
+
 # <div align="center">PaperBanana 🍌</div>
 <div align="center">Dawei Zhu, Rui Meng, Yale Song, Xiyu Wei, Sujian Li, Tomas Pfister and Jinsung yoon
 <br><br></div>
