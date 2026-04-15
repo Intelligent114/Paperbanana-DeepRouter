@@ -412,7 +412,7 @@ def main():
                 "Number of Candidates",
                 min_value=1,
                 max_value=20,
-                value=10,
+                value=3,
                 key="tab1_num_candidates",
                 help="How many parallel candidates to generate"
             )
@@ -428,7 +428,7 @@ def main():
                 "Max Critic Rounds",
                 min_value=1,
                 max_value=5,
-                value=3,
+                value=2,
                 key="tab1_max_critic_rounds",
                 help="Maximum number of critic refinement iterations"
             )

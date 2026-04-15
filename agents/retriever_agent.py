@@ -140,22 +140,38 @@ class RetrieverAgent(BaseAgent):
     
     async def _retrieve_and_parse(self, data: Dict[str, Any], cfg: dict) -> list:
         """Call retrieval model and parse results"""
-        content = str(data["content"])
+        # Truncation limits – retrieval only needs enough text to judge topic similarity.
+        # Full methodology sections can exceed 10k chars each; 200 × 10k ≈ 700k tokens.
+        CONTENT_TRUNCATE = 800   # chars per candidate content field
+        VISUAL_INTENT_TRUNCATE = 300   # chars per candidate visual_intent field
+        TARGET_CONTENT_TRUNCATE = 1500  # chars for the target content (more context ok)
+
+        content_raw = str(data["content"])
         visual_intent = data["visual_intent"]
-        
-        user_prompt = f"**Target Input**\n- {cfg['target_labels'][0]}: {visual_intent}\n- {cfg['target_labels'][1]}: {content}\n\n**Candidate Pool**\n"
-        
+
+        # Truncate target fields to avoid bloating the prompt header
+        content_display = content_raw[:TARGET_CONTENT_TRUNCATE] + ("…" if len(content_raw) > TARGET_CONTENT_TRUNCATE else "")
+        vi_display = visual_intent[:VISUAL_INTENT_TRUNCATE] + ("…" if len(visual_intent) > VISUAL_INTENT_TRUNCATE else "")
+
+        user_prompt = f"**Target Input**\n- {cfg['target_labels'][0]}: {vi_display}\n- {cfg['target_labels'][1]}: {content_display}\n\n**Candidate Pool**\n"
+
         with open(self.exp_config.work_dir / f"data/PaperBananaBench/{cfg['task_name']}/ref.json", "r", encoding="utf-8") as f:
             candidate_pool = json.load(f)
             if cfg["ref_limit"]:
                 candidate_pool = candidate_pool[:cfg["ref_limit"]]
         
         for idx, item in enumerate(candidate_pool):
+            # Truncate each candidate's fields – semantic similarity can be judged from a short excerpt
+            c_text = str(item['content'])
+            vi_text = str(item['visual_intent'])
+            c_trunc = c_text[:CONTENT_TRUNCATE] + ("…" if len(c_text) > CONTENT_TRUNCATE else "")
+            vi_trunc = vi_text[:VISUAL_INTENT_TRUNCATE] + ("…" if len(vi_text) > VISUAL_INTENT_TRUNCATE else "")
+
             user_prompt += f"Candidate {cfg['candidate_type']} {idx+1}:\n"
             user_prompt += f"- {cfg['candidate_labels'][0]}: {item['id']}\n"
-            user_prompt += f"- {cfg['candidate_labels'][1]}: {item['visual_intent']}\n"
-            user_prompt += f"- {cfg['candidate_labels'][2]}: {str(item['content'])}\n\n"
-        
+            user_prompt += f"- {cfg['candidate_labels'][1]}: {vi_trunc}\n"
+            user_prompt += f"- {cfg['candidate_labels'][2]}: {c_trunc}\n\n"
+
         user_prompt += f"Now, based on the Target Input and the Candidate Pool, {cfg['instruction_suffix']}"
         content_list = [{"type": "text", "text": user_prompt}]
         
@@ -168,11 +184,14 @@ class RetrieverAgent(BaseAgent):
                 candidate_count=1,
                 max_output_tokens=50000,
             ),
-            max_attempts=5,
+            max_attempts=10,
             retry_delay=30,
         )
         
         # Parse the retrieval result (migrated from get_references.py)
+        if not response_list or response_list[0] is None or response_list[0] in ("", "Error"):
+            print(f"Warning: Retriever got empty/error response. Returning empty reference list.")
+            return []
         raw_response = response_list[0].strip()
         return self._parse_retrieval_result(raw_response, cfg["task_name"])
     

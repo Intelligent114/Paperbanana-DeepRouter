@@ -22,14 +22,16 @@ defaults:
 # API Keys.
 api_keys:
   google_api_key: ""
-  openai_api_key: ""   # DeepRouter API Key
+  openai_api_key: ""   # API Key for text model (e.g. DeepRouter)
+  image_openai_api_key: ""   # API Key for image model; falls back to openai_api_key if empty
   anthropic_api_key: ""
 
 # Base URLs for third-party API providers.
 # All models (including gemini-*) will be routed through the OpenAI-compatible
 # client when openai_base_url is set.
 base_urls:
-  openai_base_url: "https://deeprouter.top/v1"   # DeepRouter endpoint (without /responses)
+  openai_base_url: "https://deeprouter.top/v1"   # DeepRouter endpoint for text model
+  image_openai_base_url: ""   # Base URL for image model; falls back to openai_base_url if empty
   anthropic_base_url: ""
 
 # OpenAI API style: "chat" (default, uses /v1/chat/completions)

@@ -8,6 +8,7 @@ tqdm
 json_repair
 anthropic
 openai
+httpx
 matplotlib
 python-dotenv
 pyyaml

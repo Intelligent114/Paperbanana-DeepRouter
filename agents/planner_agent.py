@@ -109,7 +109,7 @@ class PlannerAgent(BaseAgent):
                 candidate_count=1,
                 max_output_tokens=50000,
             ),
-            max_attempts=5,
+            max_attempts=10,
             retry_delay=5,
         )
         

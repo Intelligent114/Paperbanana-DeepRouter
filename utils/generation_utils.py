@@ -80,6 +80,7 @@ if not openai_api_style:
 
 # API style for image models; falls back to openai_api_style if not explicitly set
 image_api_style = model_config.get("image_api_style") or os.getenv("IMAGE_API_STYLE") or openai_api_style
+
 if openai_api_key:
     openai_client_kwargs = {"api_key": openai_api_key}
     if openai_base_url:
@@ -89,6 +90,27 @@ if openai_api_key:
 else:
     print("Warning: Could not initialize OpenAI Client. Missing credentials.")
     openai_client = None
+
+# --- Image model client (may use a different API key / base URL) ---
+# Falls back to openai_api_key / openai_base_url when image-specific values are not set.
+image_openai_api_key = get_config_val("api_keys", "image_openai_api_key", "IMAGE_OPENAI_API_KEY", "") or openai_api_key
+image_openai_base_url = get_config_val("base_urls", "image_openai_base_url", "IMAGE_OPENAI_BASE_URL", "") or openai_base_url
+
+if image_openai_api_key:
+    _img_same_as_text = (image_openai_api_key == openai_api_key and image_openai_base_url == openai_base_url)
+    if _img_same_as_text and openai_client is not None:
+        # Reuse the same client instance to avoid unnecessary connections
+        image_openai_client = openai_client
+        print("Image OpenAI Client: reusing text model client (same credentials)")
+    else:
+        image_client_kwargs = {"api_key": image_openai_api_key}
+        if image_openai_base_url:
+            image_client_kwargs["base_url"] = image_openai_base_url
+        image_openai_client = AsyncOpenAI(**image_client_kwargs)
+        print(f"Initialized Image OpenAI Client with separate API Key{' and custom base_url' if image_openai_base_url else ''}")
+else:
+    print("Warning: Could not initialize Image OpenAI Client. Missing credentials.")
+    image_openai_client = None
 
 
 def get_model_backend(model_name: str) -> str:
@@ -437,7 +459,7 @@ async def call_openai_responses_with_retry_async(
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
             )
-            response_text_list.append(first_response.output_text)
+            response_text_list.append(first_response.output_text if first_response.output_text is not None else "")
             is_input_valid = True
             break
         except Exception as e:
@@ -472,13 +494,13 @@ async def call_openai_responses_with_retry_async(
                 print(f"Error generating a subsequent candidate: {res}")
                 response_text_list.append("Error")
             else:
-                response_text_list.append(res.output_text)
+                response_text_list.append(res.output_text if res.output_text is not None else "")
 
     return response_text_list
 
 
 async def call_openai_with_retry_async(
-    model_name, contents, config, max_attempts=5, retry_delay=30, error_context=""
+    model_name, contents, config, max_attempts=10, retry_delay=30, error_context=""
 ):
     """
     ASYNC: Call OpenAI API with asynchronous retry logic.
@@ -511,7 +533,9 @@ async def call_openai_with_retry_async(
                 max_completion_tokens=max_completion_tokens,
             )
             # If we reach here, the input is valid.
-            response_text_list.append(first_response.choices[0].message.content)
+            # Guard against None content (some providers return null on empty output)
+            content = first_response.choices[0].message.content
+            response_text_list.append(content if content is not None else "")
             is_input_valid = True
             break  # Exit the validation loop
 
@@ -557,7 +581,8 @@ async def call_openai_with_retry_async(
                 print(f"Error generating a subsequent candidate: {res}")
                 response_text_list.append("Error")
             else:
-                response_text_list.append(res.choices[0].message.content)
+                content = res.choices[0].message.content
+                response_text_list.append(content if content is not None else "")
 
     return response_text_list
 
@@ -617,33 +642,77 @@ async def call_openai_image_generation_with_retry_async(
 
 
 async def call_openai_image_chat_with_retry_async(
-    model_name, prompt, system_prompt="", max_attempts=5, retry_delay=30, error_context=""
+    model_name, prompt, system_prompt="", max_attempts=10, retry_delay=30, error_context=""
 ):
     """
     ASYNC: Generate an image via an OpenAI-compatible endpoint.
     Supports both chat completions (/v1/chat/completions) and
-    Responses API (/v1/responses) depending on openai_api_style.
+    Responses API (/v1/responses) depending on image_api_style.
+    Uses image_openai_client (which may have a separate API key / base URL).
+
+    The response may be:
+      - A data: URL with inline base64
+      - A raw base64 string
+      - A Markdown image link: ![...](https://...)
+      - A plain https:// URL pointing to an image
+
+    In the URL cases the image is downloaded automatically and returned as base64.
 
     Returns a list with one base64-encoded PNG/JPEG string, or ["Error"] on failure.
     """
     import re as _re
 
-    def _extract_image(content: str):
-        """Try to pull a base64 image out of a text response."""
+    def _extract_image_or_url(content: str):
+        """Return (b64_str, url) from a text response. Exactly one will be non-None."""
+        # 1. Inline data URL
         data_url_match = _re.search(
             r"data:image/[^;]+;base64,([A-Za-z0-9+/=]+)", content
         )
         if data_url_match:
-            return data_url_match.group(1)
+            return data_url_match.group(1), None
+
+        # 2. Markdown image link: ![alt](url)
+        md_match = _re.search(r"!\[.*?\]\((https?://[^\s)]+)\)", content)
+        if md_match:
+            return None, md_match.group(1)
+
+        # 3. Plain URL that looks like an image (with or without extension)
+        url_match = _re.search(
+            r"https?://\S+?\.(?:jpg|jpeg|png|gif|webp)(?:[?#]\S*)?",
+            content,
+            _re.IGNORECASE,
+        )
+        if url_match:
+            return None, url_match.group(0)
+
+        # 4. Bare https URL on its own line (CDN links without extension)
+        bare_url_match = _re.search(r"^(https?://\S+)$", content.strip(), _re.MULTILINE)
+        if bare_url_match:
+            return None, bare_url_match.group(1)
+
+        # 5. Raw base64 string
         stripped = content.strip()
         if stripped and _re.fullmatch(r"[A-Za-z0-9+/=\n]+", stripped) and len(stripped) > 200:
-            return stripped.replace("\n", "")
-        return None
+            return stripped.replace("\n", ""), None
+
+        return None, None
+
+    async def _download_url_to_b64(url: str) -> str | None:
+        """Download an image from a URL and return as base64, or None on failure."""
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                return base64.b64encode(resp.content).decode("utf-8")
+        except Exception as e:
+            print(f"[Warning] Failed to download image from {url}: {e}")
+            return None
 
     for attempt in range(max_attempts):
         try:
             if image_api_style == "responses":
-                response = await openai_client.responses.create(
+                response = await image_openai_client.responses.create(
                     model=model_name,
                     input=prompt,
                     instructions=system_prompt or None,
@@ -654,20 +723,33 @@ async def call_openai_image_chat_with_retry_async(
                 if system_prompt:
                     messages.append({"role": "system", "content": system_prompt})
                 messages.append({"role": "user", "content": prompt})
-                response = await openai_client.chat.completions.create(
+                response = await image_openai_client.chat.completions.create(
                     model=model_name,
                     messages=messages,
                 )
                 content = response.choices[0].message.content or ""
 
-            img = _extract_image(content)
-            if img:
-                return [img]
+            b64, url = _extract_image_or_url(content)
+
+            if b64:
+                return [b64]
+
+            if url:
+                print(f"[Info] call_openai_image_chat: response contains image URL, downloading... {url[:100]}")
+                b64 = await _download_url_to_b64(url)
+                if b64:
+                    return [b64]
+                # Download failed – retry the whole API call
+                print(f"[Warning] Image download failed, retrying API call (attempt {attempt + 1})...")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(retry_delay)
+                continue
 
             print(
                 f"[Warning] call_openai_image_chat: response does not appear to contain "
-                f"a base64 image. Raw content preview: {content[:200]}"
+                f"a base64 image or URL. Raw content preview: {content[:200]}"
             )
+            # Unrecognisable content – no point retrying the same call; return as-is
             return [content]
 
         except Exception as e:
