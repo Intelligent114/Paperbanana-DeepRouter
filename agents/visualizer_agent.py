@@ -163,20 +163,19 @@ class VisualizerAgent(BaseAgent):
 
             backend = generation_utils.get_model_backend(self.model_name)
 
-            if backend == "gemini":
-                response_list = await generation_utils.call_gemini_with_retry_async(
-                    model_name=self.model_name,
-                    contents=content_list,
-                    config=types.GenerateContentConfig(**gen_config_args),
-                    max_attempts=5,
-                    retry_delay=30,
-                )
-            elif backend == "openai" and cfg["use_image_generation"]:
-                # Third-party provider serving image model via chat completions
-                response_list = await generation_utils.call_openai_image_chat_with_retry_async(
+            if cfg["use_image_generation"]:
+                aspect_ratio = "1:1"
+                if "additional_info" in data and "rounded_ratio" in data["additional_info"]:
+                    aspect_ratio = data["additional_info"]["rounded_ratio"]
+
+                response_list = await generation_utils.call_image_model_with_retry_async(
                     model_name=self.model_name,
                     prompt=prompt_text,
                     system_prompt=self.system_prompt,
+                    aspect_ratio=aspect_ratio,
+                    image_size="1k",
+                    temperature=self.exp_config.temperature,
+                    max_output_tokens=cfg["max_output_tokens"],
                     max_attempts=5,
                     retry_delay=30,
                 )
@@ -191,20 +190,6 @@ class VisualizerAgent(BaseAgent):
                         "candidate_num": 1,
                         "max_completion_tokens": gen_config_args.get("max_output_tokens", 50000),
                     },
-                    max_attempts=5,
-                    retry_delay=30,
-                )
-            elif "gpt-image" in self.model_name:
-                image_config = {
-                    "size": "1536x1024",
-                    "quality": "high",
-                    "background": "opaque",
-                    "output_format": "png",
-                }
-                response_list = await generation_utils.call_openai_image_generation_with_retry_async(
-                    model_name=self.model_name,
-                    prompt=prompt_text,
-                    config=image_config,
                     max_attempts=5,
                     retry_delay=30,
                 )

@@ -32,6 +32,7 @@ api_keys:
 base_urls:
   openai_base_url: "https://deeprouter.top/v1"   # DeepRouter endpoint for text model
   image_openai_base_url: ""   # Base URL for image model; falls back to openai_base_url if empty
+  image_custom_endpoint: "https://deeprouter.top/v1/chat/completions"   # Exact image model endpoint provided by the API vendor
   anthropic_base_url: ""
 
 # OpenAI API style: "chat" (default, uses /v1/chat/completions)

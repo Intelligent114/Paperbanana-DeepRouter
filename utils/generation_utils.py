@@ -95,6 +95,7 @@ else:
 # Falls back to openai_api_key / openai_base_url when image-specific values are not set.
 image_openai_api_key = get_config_val("api_keys", "image_openai_api_key", "IMAGE_OPENAI_API_KEY", "") or openai_api_key
 image_openai_base_url = get_config_val("base_urls", "image_openai_base_url", "IMAGE_OPENAI_BASE_URL", "") or openai_base_url
+image_custom_endpoint = get_config_val("base_urls", "image_custom_endpoint", "IMAGE_CUSTOM_ENDPOINT", "")
 
 if image_openai_api_key:
     _img_same_as_text = (image_openai_api_key == openai_api_key and image_openai_base_url == openai_base_url)
@@ -641,8 +642,85 @@ async def call_openai_image_generation_with_retry_async(
     return ["Error"]
 
 
+async def call_image_model_with_retry_async(
+    model_name,
+    prompt,
+    system_prompt="",
+    input_image_b64=None,
+    input_image_media_type="image/jpeg",
+    aspect_ratio="1:1",
+    image_size="1k",
+    temperature=1.0,
+    max_output_tokens=8192,
+    max_attempts=5,
+    retry_delay=30,
+    error_context="",
+):
+    """Unified entrypoint for image generation/editing used by both visualizer and demo refine."""
+    backend = get_model_backend(model_name)
+
+    if backend == "gemini":
+        contents = [{"type": "text", "text": prompt}]
+        if input_image_b64:
+            contents.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": input_image_media_type,
+                    "data": input_image_b64,
+                },
+            })
+
+        size_map = {
+            "1K": "1k",
+            "2K": "2k",
+            "4K": "4k",
+            "1k": "1k",
+            "2k": "2k",
+            "4k": "4k",
+        }
+        gemini_image_size = size_map.get(image_size, str(image_size).lower())
+
+        return await call_gemini_with_retry_async(
+            model_name=model_name,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt or None,
+                temperature=temperature,
+                candidate_count=1,
+                max_output_tokens=max_output_tokens,
+                response_modalities=["IMAGE"],
+                image_config=types.ImageConfig(
+                    aspect_ratio=aspect_ratio,
+                    image_size=gemini_image_size,
+                ),
+            ),
+            max_attempts=max_attempts,
+            retry_delay=retry_delay,
+            error_context=error_context,
+        )
+
+    return await call_openai_image_chat_with_retry_async(
+        model_name=model_name,
+        prompt=prompt,
+        system_prompt=system_prompt,
+        input_image_b64=input_image_b64,
+        input_image_media_type=input_image_media_type,
+        max_attempts=max_attempts,
+        retry_delay=retry_delay,
+        error_context=error_context,
+    )
+
+
 async def call_openai_image_chat_with_retry_async(
-    model_name, prompt, system_prompt="", max_attempts=10, retry_delay=30, error_context=""
+    model_name,
+    prompt,
+    system_prompt="",
+    input_image_b64=None,
+    input_image_media_type="image/jpeg",
+    max_attempts=10,
+    retry_delay=30,
+    error_context="",
 ):
     """
     ASYNC: Generate an image via an OpenAI-compatible endpoint.
@@ -709,25 +787,125 @@ async def call_openai_image_chat_with_retry_async(
             print(f"[Warning] Failed to download image from {url}: {e}")
             return None
 
+    def _normalise_content(content):
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, str):
+                    text_parts.append(item)
+                elif isinstance(item, dict):
+                    if item.get("text"):
+                        text_parts.append(item["text"])
+                    elif item.get("type") == "output_text" and item.get("text"):
+                        text_parts.append(item["text"])
+            return "\n".join(text_parts)
+        return str(content)
+
+    async def _call_custom_image_endpoint(messages):
+        import httpx
+
+        if not image_custom_endpoint:
+            return None
+
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "stream": False,
+        }
+        if image_api_style == "responses":
+            payload = {
+                "model": model_name,
+                "input": messages,
+                "stream": False,
+            }
+            if system_prompt:
+                payload["instructions"] = system_prompt
+
+        headers = {
+            "Authorization": f"Bearer {image_openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+            resp = await client.post(image_custom_endpoint, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        # Try a few common response shapes.
+        if isinstance(data, dict):
+            if data.get("output_text"):
+                return _normalise_content(data.get("output_text"))
+            if data.get("choices"):
+                choice = data["choices"][0]
+                message = choice.get("message", {}) if isinstance(choice, dict) else {}
+                return _normalise_content(message.get("content"))
+            if data.get("data") and isinstance(data["data"], list):
+                first_item = data["data"][0]
+                if isinstance(first_item, dict):
+                    if first_item.get("b64_json"):
+                        return first_item["b64_json"]
+                    if first_item.get("url"):
+                        return first_item["url"]
+        return _normalise_content(data)
+
     for attempt in range(max_attempts):
         try:
             if image_api_style == "responses":
-                response = await image_openai_client.responses.create(
-                    model=model_name,
-                    input=prompt,
-                    instructions=system_prompt or None,
-                )
-                content = response.output_text or ""
+                if input_image_b64:
+                    response_input = [{
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:{input_image_media_type};base64,{input_image_b64}",
+                            },
+                        ],
+                    }]
+                else:
+                    response_input = prompt
+
+                messages = response_input
+                if image_custom_endpoint:
+                    content = await _call_custom_image_endpoint(messages)
+                else:
+                    response = await image_openai_client.responses.create(
+                        model=model_name,
+                        input=response_input,
+                        instructions=system_prompt or None,
+                    )
+                    content = response.output_text or ""
             else:
                 messages = []
                 if system_prompt:
                     messages.append({"role": "system", "content": system_prompt})
-                messages.append({"role": "user", "content": prompt})
-                response = await image_openai_client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                )
-                content = response.choices[0].message.content or ""
+
+                user_content = []
+                if prompt:
+                    user_content.append({"type": "text", "text": prompt})
+                if input_image_b64:
+                    user_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{input_image_media_type};base64,{input_image_b64}"
+                        }
+                    })
+
+                messages.append({
+                    "role": "user",
+                    "content": user_content if user_content else prompt,
+                })
+                if image_custom_endpoint:
+                    content = await _call_custom_image_endpoint(messages)
+                else:
+                    response = await image_openai_client.chat.completions.create(
+                        model=model_name,
+                        messages=messages,
+                    )
+                    content = _normalise_content(response.choices[0].message.content)
 
             b64, url = _extract_image_or_url(content)
 

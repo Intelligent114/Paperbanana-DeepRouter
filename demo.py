@@ -105,6 +105,82 @@ def base64_to_image(b64_str):
     except Exception:
         return None
 
+
+def get_final_image_key(result, task_name="diagram", max_rounds=3, exp_mode="demo_full"):
+    """Resolve the final image key for a candidate result."""
+    for round_idx in range(max_rounds, -1, -1):
+        image_key = f"target_{task_name}_critic_desc{round_idx}_base64_jpg"
+        if image_key in result and result[image_key]:
+            return image_key
+
+    if exp_mode == "demo_full":
+        return f"target_{task_name}_stylist_desc0_base64_jpg"
+    return f"target_{task_name}_desc0_base64_jpg"
+
+
+def _collect_stage_image_keys(result):
+    """Collect all image-stage keys stored as *_base64_jpg in deterministic order."""
+    if not isinstance(result, dict):
+        return []
+
+    image_keys = [k for k, v in result.items() if k.endswith("_base64_jpg") and v]
+
+    def _sort_key(key):
+        # Keep common pipeline stages first, then fallback to lexical order.
+        priority = 99
+        if "_desc0_base64_jpg" in key and "critic" not in key and "stylist" not in key:
+            priority = 10  # planner/base
+        elif "_stylist_desc0_base64_jpg" in key:
+            priority = 20
+        elif "_critic_desc" in key and "_base64_jpg" in key:
+            priority = 30
+        elif "vanilla_" in key:
+            priority = 5
+        return (priority, key)
+
+    return sorted(image_keys, key=_sort_key)
+
+
+def persist_demo_run(results, task_start_ts, exp_mode, task_name="diagram"):
+    """Persist one demo run under a task-start-time directory."""
+    run_dir = Path(__file__).parent / "results" / "demo" / f"task_{task_start_ts}"
+    images_dir = run_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save full structured results json.
+    json_path = run_dir / "results.json"
+    with open(json_path, "w", encoding="utf-8", errors="surrogateescape") as f:
+        json_string = json.dumps(results, ensure_ascii=False, indent=4)
+        json_string = json_string.encode("utf-8", "ignore").decode("utf-8")
+        f.write(json_string)
+
+    # Save final image per candidate for direct filesystem access.
+    for candidate_id, result in enumerate(results):
+        candidate_dir = images_dir / f"candidate_{candidate_id}"
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+
+        # Persist all stage images for this candidate.
+        for image_key in _collect_stage_image_keys(result):
+            stage_img = base64_to_image(result.get(image_key))
+            if stage_img:
+                stage_name = image_key.replace("_base64_jpg", "")
+                stage_img.save(candidate_dir / f"{stage_name}.png", format="PNG")
+
+        # Keep a flat final image for quick access and backward compatibility.
+        final_image_key = get_final_image_key(
+            result,
+            task_name=task_name,
+            max_rounds=3,
+            exp_mode=exp_mode,
+        )
+        if final_image_key and final_image_key in result and result[final_image_key]:
+            img = base64_to_image(result[final_image_key])
+            if img:
+                image_path = images_dir / f"candidate_{candidate_id}.png"
+                img.save(image_path, format="PNG")
+
+    return run_dir, json_path
+
 def create_sample_inputs(method_content, caption, diagram_type="Pipeline", aspect_ratio="16:9", num_copies=10, max_critic_rounds=3):
     """Create multiple copies of the input data for parallel processing."""
     base_input = {
@@ -165,11 +241,11 @@ async def process_parallel_candidates(data_list, exp_mode="dev_planner_critic", 
 
 async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9", image_size="2K"):
     """
-    Refine an image using an Image Editing API.
+    Refine an image using the configured image model.
     
     Args:
-        image_bytes: Image data in bytes
-        edit_prompt: Text description of desired changes
+        image_bytes: Image data in bytes (used to infer context if supported)
+        edit_prompt: Text description of desired changes / target image description
         aspect_ratio: Output aspect ratio (21:9, 16:9, 3:2)
         image_size: Output resolution (2K or 4K)
     
@@ -177,58 +253,56 @@ async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9
         Tuple of (edited_image_bytes, success_message)
     """
     try:
-        from google import genai
-        from google.genai import types
-        
-        # Initialize client
-        project_id = get_config_val("google_cloud", "project_id", "GOOGLE_CLOUD_PROJECT", "")
-        location = get_config_val("google_cloud", "location", "GOOGLE_CLOUD_LOCATION", "global")
-        
-        client = genai.Client(vertexai=True, project=project_id, location=location)
-        
-        # Prepare content
-        contents = [
-            types.Part.from_text(text=edit_prompt),
-            types.Part.from_bytes(
-                mime_type="image/jpeg",
-                data=image_bytes
-            )
-        ]
-        
-        # Configure generation
-        config = types.GenerateContentConfig(
+        from utils import generation_utils
+
+        image_model = get_config_val("defaults", "image_model_name", "IMAGE_MODEL_NAME", "")
+        if not image_model:
+            return None, "❌ Image model not configured. Check 'image_model_name' in model_config.yaml"
+
+        refined_prompt = (
+            "You are an expert scientific figure editor. "
+            "Edit the uploaded diagram according to the user's instructions while preserving "
+            "the original structure unless the user explicitly asks to change it. "
+            f"Target aspect ratio: {aspect_ratio}. Target output resolution: {image_size}.\n\n"
+            f"User instructions: {edit_prompt}"
+        )
+
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        response_list = await generation_utils.call_image_model_with_retry_async(
+            model_name=image_model,
+            prompt=refined_prompt,
+            system_prompt="You are an expert scientific figure editor.",
+            input_image_b64=image_b64,
+            input_image_media_type="image/jpeg",
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
             temperature=1.0,
             max_output_tokens=8192,
-            response_modalities=["IMAGE"],
-            image_config=types.ImageConfig(
-                aspect_ratio=aspect_ratio,
-                image_size=image_size,
-            ),
+            max_attempts=5,
+            retry_delay=10,
+            error_context="refine image",
         )
-        
-        # Generate refined image
-        image_model = get_config_val("defaults", "image_model_name", "IMAGE_MODEL_NAME", "")
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=image_model,
-            contents=contents,
-            config=config
-        )
-        
-        # Extract image from response
-        if response.candidates and response.candidates[0].content.parts:
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, 'inline_data') and part.inline_data:
-                    edited_image_data = part.inline_data.data
-                    
-                    if isinstance(edited_image_data, bytes):
-                        return edited_image_data, "✅ Image refined successfully!"
-                    elif isinstance(edited_image_data, str):
-                        return base64.b64decode(edited_image_data), "✅ Image refined successfully!"
-        
-        return None, "❌ No image data found in response"
+
+        if not response_list or not response_list[0] or response_list[0] == "Error":
+            return None, f"❌ Image model `{image_model}` did not return a valid image. Please verify the model name and provider route."
+
+        img_b64 = response_list[0]
+        if isinstance(img_b64, str) and "," in img_b64 and img_b64.startswith("data:image"):
+            img_b64 = img_b64.split(",", 1)[1]
+
+        try:
+            image_data = base64.b64decode(img_b64, validate=True)
+            return image_data, "✅ Image refined successfully!"
+        except Exception as decode_err:
+            print(f"Warning: Could not decode base64 response: {decode_err}")
+            preview = str(response_list[0])[:200]
+            return None, f"❌ 图片模型没有返回可解码图片。当前返回预览: {preview}"
     
     except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"Error in refine_image_with_nanoviz: {error_detail}")
         return None, f"❌ Error: {str(e)}"
 
 
@@ -309,7 +383,7 @@ def display_candidate_result(result, candidate_id, exp_mode):
     if final_image_key and final_image_key in result:
         img = base64_to_image(result[final_image_key])
         if img:
-            st.image(img, use_container_width=True, caption=f"Candidate {candidate_id} (Final)")
+            st.image(img, width="stretch", caption=f"Candidate {candidate_id} (Final)")
             
             # Add download button
             buffered = BytesIO()
@@ -320,7 +394,7 @@ def display_candidate_result(result, candidate_id, exp_mode):
                 file_name=f"candidate_{candidate_id}.png",
                 mime="image/png",
                 key=f"download_candidate_{candidate_id}",
-                use_container_width=True
+                width="stretch"
             )
         else:
             st.error(f"Failed to decode image for Candidate {candidate_id}")
@@ -340,7 +414,7 @@ def display_candidate_result(result, candidate_id, exp_mode):
                 # Display the image for this stage
                 stage_img = base64_to_image(result.get(stage['image_key']))
                 if stage_img:
-                    st.image(stage_img, use_container_width=True)
+                    st.image(stage_img, width="stretch")
                 
                 # Show description
                 if stage['desc_key'] in result:
@@ -549,7 +623,7 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
             )
         
         # Process button
-        if st.button("🚀 Generate Candidates", type="primary", use_container_width=True):
+        if st.button("🚀 Generate Candidates", type="primary", width="stretch"):
             if not method_content or not caption:
                 st.error("Please provide both method content and caption!")
             else:
@@ -558,6 +632,9 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                 st.session_state["caption"] = caption
                 
                 with st.spinner(f"Generating {num_candidates} candidates in parallel... This may take a few minutes."):
+                    task_start_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    st.session_state["task_start_ts"] = task_start_ts
+
                     # Create input data list
                     input_data_list = create_sample_inputs(
                         method_content=method_content,
@@ -580,27 +657,21 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                         timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         st.session_state["timestamp"] = timestamp_str
                         
-                        # Save results to JSON file
+                        # Persist run artifacts (results json + final candidate images)
                         try:
-                            # Create results directory if it doesn't exist
-                            results_dir = Path(__file__).parent / "results" / "demo"
-                            results_dir.mkdir(parents=True, exist_ok=True)
-                            
-                            # Generate filename with timestamp
-                            json_filename = results_dir / f"demo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-                            
-                            # Save to JSON with proper encoding handling (like main.py)
-                            with open(json_filename, "w", encoding="utf-8", errors="surrogateescape") as f:
-                                json_string = json.dumps(results, ensure_ascii=False, indent=4)
-                                # Clean invalid UTF-8 characters
-                                json_string = json_string.encode("utf-8", "ignore").decode("utf-8")
-                                f.write(json_string)
-                            
-                            st.session_state["json_file"] = str(json_filename)
+                            run_dir, json_path = persist_demo_run(
+                                results=results,
+                                task_start_ts=task_start_ts,
+                                exp_mode=exp_mode,
+                                task_name="diagram",
+                            )
+
+                            st.session_state["run_dir"] = str(run_dir)
+                            st.session_state["json_file"] = str(json_path)
                             st.success(f"✅ Successfully generated {len(results)} candidates!")
-                            st.info(f"💾 Results saved to: `{json_filename.name}`")
+                            st.info(f"💾 Results saved to: `{run_dir.relative_to(Path.cwd())}`")
                         except Exception as e:
-                            st.warning(f"⚠️ Generated {len(results)} candidates, but failed to save JSON: {e}")
+                            st.warning(f"⚠️ Generated {len(results)} candidates, but failed to persist artifacts: {e}")
                     except Exception as e:
                         st.error(f"Error during processing: {e}")
                         import traceback
@@ -631,7 +702,7 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                             data=json_data,
                             file_name=json_file_path.name,
                             mime="application/json",
-                            use_container_width=True
+                            width="stretch"
                         )
             
             # Display results in a grid (3 columns)
@@ -662,20 +733,13 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                         # Find the final image key (same logic as display)
                         final_image_key = None
                         
-                        # Try to find the last critic round
-                        for round_idx in range(3, -1, -1):
-                            image_key = f"target_{task_name}_critic_desc{round_idx}_base64_jpg"
-                            if image_key in result and result[image_key]:
-                                final_image_key = image_key
-                                break
-                        
-                        # Fallback if no critic rounds completed
-                        if not final_image_key:
-                            if current_mode == "demo_full":
-                                final_image_key = f"target_{task_name}_stylist_desc0_base64_jpg"
-                            else:
-                                final_image_key = f"target_{task_name}_desc0_base64_jpg"
-                        
+                        final_image_key = get_final_image_key(
+                            result,
+                            task_name=task_name,
+                            max_rounds=3,
+                            exp_mode=current_mode,
+                        )
+
                         if final_image_key and final_image_key in result:
                             img = base64_to_image(result[final_image_key])
                             if img:
@@ -692,7 +756,7 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                     data=zip_buffer.getvalue(),
                     file_name=f"papervizagent_candidates_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
                     mime="application/zip",
-                    use_container_width=True
+                    width="stretch"
                 )
                 st.success("ZIP file ready for download!")
             except Exception as e:
@@ -740,7 +804,7 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
             
             with col1:
                 st.markdown("### Original Image")
-                st.image(uploaded_image, use_container_width=True)
+                st.image(uploaded_image, width="stretch")
             
             with col2:
                 st.markdown("### Edit Instructions")
@@ -752,7 +816,7 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                     key="edit_prompt"
                 )
                 
-                if st.button("✨ Refine Image", type="primary", use_container_width=True):
+                if st.button("✨ Refine Image", type="primary", width="stretch"):
                     if not edit_prompt:
                         st.error("Please provide edit instructions!")
                     else:
@@ -795,12 +859,12 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                 
                 with col1:
                     st.markdown("### Before")
-                    st.image(uploaded_image, use_container_width=True)
+                    st.image(uploaded_image, width="stretch")
                 
                 with col2:
                     st.markdown(f"### After ({refine_resolution})")
                     refined_image = Image.open(BytesIO(st.session_state["refined_image"]))
-                    st.image(refined_image, use_container_width=True)
+                    st.image(refined_image, width="stretch")
                     
                     # Download button
                     st.download_button(
@@ -808,7 +872,7 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                         data=st.session_state["refined_image"],
                         file_name=f"refined_{refine_resolution}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
                         mime="image/png",
-                        use_container_width=True
+                        width="stretch"
                     )
 
 if __name__ == "__main__":
